@@ -1,0 +1,146 @@
+-- ================================================
+-- Poor Man's sp_AskBrent - 5 Second Snapshot
+-- Result 1: Wait Stats | Result 2: Metric/Value Summary
+-- ================================================
+-- Cleanup
+DROP TABLE IF EXISTS #WaitsBefore;
+DROP TABLE IF EXISTS #WaitsAfter;
+DROP TABLE IF EXISTS #PerfBefore;
+DROP TABLE IF EXISTS #PerfAfter;
+DROP TABLE IF EXISTS #Results;
+IF OBJECT_ID('tempdb..#WaitsBefore') IS NOT NULL DROP TABLE #WaitsBefore;
+IF OBJECT_ID('tempdb..#WaitsAfter') IS NOT NULL DROP TABLE #WaitsAfter;
+IF OBJECT_ID('tempdb..#PerfBefore') IS NOT NULL DROP TABLE #PerfBefore;
+IF OBJECT_ID('tempdb..#PerfAfter') IS NOT NULL DROP TABLE #PerfAfter;
+IF OBJECT_ID('tempdb..#Results') IS NOT NULL DROP TABLE #Results;
+
+CREATE TABLE #Results (Metric VARCHAR(100), Value VARCHAR(100));
+
+-- Snapshot #1: Waits
+SELECT wait_type, wait_time_ms, waiting_tasks_count, signal_wait_time_ms
+INTO #WaitsBefore
+FROM sys.dm_os_wait_stats
+WHERE wait_type NOT IN (
+    'CLR_SEMAPHORE','LAZYWRITER_SLEEP','RESOURCE_QUEUE','SLEEP_TASK',
+    'SLEEP_SYSTEMTASK','SQLTRACE_BUFFER_FLUSH','WAITFOR','LOGMGR_QUEUE',
+    'CHECKPOINT_QUEUE','REQUEST_FOR_DEADLOCK_SEARCH','XE_TIMER_EVENT',
+    'BROKER_TO_FLUSH','BROKER_TASK_STOP','CLR_MANUAL_EVENT','CLR_AUTO_EVENT',
+    'DISPATCHER_QUEUE_SEMAPHORE','FT_IFTS_SCHEDULER_IDLE_WAIT',
+    'XE_DISPATCHER_WAIT','XE_DISPATCHER_JOIN','BROKER_EVENTHANDLER',
+    'TRACEWRITE','FT_IFTSHC_MUTEX','SQLTRACE_INCREMENTAL_FLUSH_SLEEP',
+    'BROKER_RECEIVE_WAITFOR','ONDEMAND_TASK_QUEUE','DBMIRROR_EVENTS_QUEUE',
+    'DBMIRRORING_CMD','BROKER_TRANSMITTER','SQLTRACE_WAIT_ENTRIES'
+);
+
+-- Snapshot #1: Batch Requests/Compilations
+SELECT counter_name, cntr_value
+INTO #PerfBefore
+FROM sys.dm_os_performance_counters
+WHERE counter_name IN ('Batch Requests/sec','SQL Compilations/sec','SQL Re-Compilations/sec')
+AND object_name LIKE '%SQL Statistics%';
+
+-- Wait 5 seconds
+WAITFOR DELAY '00:00:05';
+
+-- Snapshot #2: Waits
+SELECT wait_type, wait_time_ms, waiting_tasks_count, signal_wait_time_ms
+INTO #WaitsAfter
+FROM sys.dm_os_wait_stats
+WHERE wait_type NOT IN (
+    'CLR_SEMAPHORE','LAZYWRITER_SLEEP','RESOURCE_QUEUE','SLEEP_TASK',
+    'SLEEP_SYSTEMTASK','SQLTRACE_BUFFER_FLUSH','WAITFOR','LOGMGR_QUEUE',
+    'CHECKPOINT_QUEUE','REQUEST_FOR_DEADLOCK_SEARCH','XE_TIMER_EVENT',
+    'BROKER_TO_FLUSH','BROKER_TASK_STOP','CLR_MANUAL_EVENT','CLR_AUTO_EVENT',
+    'DISPATCHER_QUEUE_SEMAPHORE','FT_IFTS_SCHEDULER_IDLE_WAIT',
+    'XE_DISPATCHER_WAIT','XE_DISPATCHER_JOIN','BROKER_EVENTHANDLER',
+    'TRACEWRITE','FT_IFTSHC_MUTEX','SQLTRACE_INCREMENTAL_FLUSH_SLEEP',
+    'BROKER_RECEIVE_WAITFOR','ONDEMAND_TASK_QUEUE','DBMIRROR_EVENTS_QUEUE',
+    'DBMIRRORING_CMD','BROKER_TRANSMITTER','SQLTRACE_WAIT_ENTRIES'
+);
+
+-- Snapshot #2: Batch Requests/Compilations
+SELECT counter_name, cntr_value
+INTO #PerfAfter
+FROM sys.dm_os_performance_counters
+WHERE counter_name IN ('Batch Requests/sec','SQL Compilations/sec','SQL Re-Compilations/sec')
+AND object_name LIKE '%SQL Statistics%';
+
+-- ================================================
+-- Insert: Wait Time Per Core (over 5 sec window)
+-- ================================================
+INSERT INTO #Results (Metric, Value)
+SELECT
+    'Wait Time Per Core (ms, 5 sec window)',
+    CAST(
+        SUM(a.wait_time_ms - b.wait_time_ms)
+        / NULLIF((
+		SELECT COUNT(*) 
+		FROM sys.dm_os_schedulers 
+		WHERE status = 'VISIBLE ONLINE'
+		), 0) / 1000
+    AS VARCHAR(100))
+FROM #WaitsAfter a
+JOIN #WaitsBefore b ON a.wait_type = b.wait_type;
+
+-- ================================================
+-- Insert: Batch Requests/sec
+-- ================================================
+INSERT INTO #Results (Metric, Value)
+SELECT
+    a.counter_name,
+    CAST((a.cntr_value - b.cntr_value) / 5.0 AS DECIMAL(10,0)) --VARCHAR(100))
+FROM #PerfAfter a
+JOIN #PerfBefore b ON a.counter_name = b.counter_name;
+
+-- ================================================
+-- Insert: CPU Utilization (single current value)
+-- ================================================
+INSERT INTO #Results (Metric, Value)
+SELECT TOP 1
+    'CPU Utilization %',
+    CAST(SQLProcessUtilization AS VARCHAR(100))
+FROM (
+    SELECT
+        record.value('(./Record/@id)[1]', 'int') AS record_id,
+        record.value('(./Record/SchedulerMonitorEvent/SystemHealth/ProcessUtilization)[1]', 'int') AS SQLProcessUtilization
+    FROM (
+        SELECT CONVERT(XML, record) AS record
+        FROM sys.dm_os_ring_buffers
+        WHERE ring_buffer_type = N'RING_BUFFER_SCHEDULER_MONITOR'
+        AND record LIKE '%<SystemHealth>%'
+    ) AS x
+) AS y
+ORDER BY record_id DESC;
+
+-- ================================================
+-- Insert: Database Summary (count + total size in GB)
+-- ================================================
+INSERT INTO #Results (Metric, Value)
+SELECT 'Total Databases', CAST(COUNT(DISTINCT d.database_id) AS VARCHAR(100))
+FROM sys.databases d
+JOIN sys.master_files mf ON d.database_id = mf.database_id;
+
+INSERT INTO #Results (Metric, Value)
+SELECT 'Total Database Size (GB)', CAST(CAST(SUM(mf.size) * 8.0 / 1024 / 1024 AS DECIMAL(10,2)) AS VARCHAR(100))
+FROM sys.databases d
+JOIN sys.master_files mf ON d.database_id = mf.database_id;
+
+-- ================================================
+-- RESULT 1: Wait Stats (last 5 sec, delta)
+-- ================================================
+SELECT
+    a.wait_type,
+    (a.wait_time_ms - b.wait_time_ms) AS wait_time_ms_delta,
+    (a.waiting_tasks_count - b.waiting_tasks_count) AS waiting_tasks_delta,
+    (a.signal_wait_time_ms - b.signal_wait_time_ms) AS signal_wait_ms_delta
+FROM #WaitsAfter a
+JOIN #WaitsBefore b ON a.wait_type = b.wait_type
+WHERE (a.wait_time_ms - b.wait_time_ms) > 0
+ORDER BY wait_time_ms_delta DESC;
+
+-- ================================================
+-- RESULT 2: Metric / Value Summary
+-- (Wait Time Per Core, Batch Requests, CPU, Databases)
+-- ================================================
+SELECT * FROM #Results;
+
