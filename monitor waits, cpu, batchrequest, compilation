@@ -73,7 +73,7 @@ SELECT
 		FROM sys.dm_os_schedulers 
 		WHERE status = 'VISIBLE ONLINE'
 		), 0) / 1000
-    AS DECIMAL(10,1))
+    AS DECIMAL(18,1))
 FROM #WaitsAfter a
 JOIN #WaitsBefore b ON a.wait_type = b.wait_type;
 
@@ -83,7 +83,7 @@ JOIN #WaitsBefore b ON a.wait_type = b.wait_type;
 INSERT INTO #Results (Metric, Value)
 SELECT
     a.counter_name,
-    CAST((a.cntr_value - b.cntr_value) / 5.0 AS DECIMAL(10,0))
+    CAST((CAST(a.cntr_value AS BIGINT) - CAST(b.cntr_value AS BIGINT)) / 5.0 AS DECIMAL(18,0))
 FROM #PerfAfter a
 JOIN #PerfBefore b ON a.counter_name = b.counter_name;
 
@@ -116,7 +116,8 @@ FROM sys.databases d
 JOIN sys.master_files mf ON d.database_id = mf.database_id;
 
 INSERT INTO #Results (Metric, Value)
-SELECT 'Total Database Size (GB)', CAST(CAST(SUM(mf.size) * 8.0 / 1024 / 1024 AS DECIMAL(10,2)) AS VARCHAR(100))
+SELECT 'Total Database Size (GB)',
+    CAST(CAST(SUM(CAST(mf.size AS BIGINT)) * 8.0 / 1024 / 1024 AS DECIMAL(18,2)) AS VARCHAR(100))
 FROM sys.databases d
 JOIN sys.master_files mf ON d.database_id = mf.database_id;
 
@@ -125,9 +126,9 @@ JOIN sys.master_files mf ON d.database_id = mf.database_id;
 -- ================================================
 SELECT
     a.wait_type,
-    CAST((a.wait_time_ms - b.wait_time_ms) / 1000.0 AS DECIMAL(10,1)) AS wait_time_sec_delta,
+    CAST((a.wait_time_ms - b.wait_time_ms) / 1000.0 AS DECIMAL(18,1)) AS wait_time_sec_delta,
     (a.waiting_tasks_count - b.waiting_tasks_count) AS waiting_tasks_delta,
-    CAST((a.signal_wait_time_ms - b.signal_wait_time_ms) / 1000.0 AS DECIMAL(10,1)) AS signal_wait_sec_delta
+    CAST((a.signal_wait_time_ms - b.signal_wait_time_ms) / 1000.0 AS DECIMAL(18,1)) AS signal_wait_sec_delta
 FROM #WaitsAfter a
 JOIN #WaitsBefore b ON a.wait_type = b.wait_type
 WHERE (a.wait_time_ms - b.wait_time_ms) > 0
